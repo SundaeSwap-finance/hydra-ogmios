@@ -12,10 +12,11 @@ struct Event {
 }
 
 #[derive(Serialize, Deserialize, Debug)]
-#[serde(rename_all = "camelCase")]
-struct StateChanged {
-    chain_slot: u64,
-    tag: String,
+#[serde(tag = "tag", rename_all_fields = "camelCase")]
+enum StateChanged {
+    TickObserved {
+        chain_slot: u64,
+    },
 }
 
 fn main() {
