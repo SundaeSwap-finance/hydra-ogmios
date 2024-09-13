@@ -1,0 +1,61 @@
+{
+    "signatures": {
+      "multiSignature": [
+        "e7f3a4c507fd762d464c411737183127fa8c7a3ed6ee23eb975a29f6769339120114282b91987ad31e5302e6d180793bb3bdd144378777d1cfc1e76b006c0703",
+        "ac11dc6ab1212694e33fdeea47e0b6cfe425311ea9a4e12c176d39b956df5f1c5c505de5c6711b341ba387e8433e7af3681735ee0745d1fc31c5ee42b977c10c",
+        "8d4aeff1698a03b241d48e866a843d1662ef9a85d132241f6b044e4de4d8e31ccfa805867787b488d15740490ec9701845699f813db6002effa5df7b012c4d08"
+      ]
+    },
+    "snapshot": {
+      "confirmedTransactions": [
+        "0bd8311167aba722516deea66ca858419d6c4c55262392592550016b15fcf325"
+      ],
+      "headId": "d55bddadf5a40f750a5c682e645690f617da00bf4d6bf194e04778a2",
+      "snapshotNumber": 1,
+      "utxo": {
+        "0bd8311167aba722516deea66ca858419d6c4c55262392592550016b15fcf325#0": {
+          "address": "addr_test1vqx5tu4nzz5cuanvac4t9an4djghrx7hkdvjnnhstqm9kegvm6g6c",
+          "datum": null,
+          "datumhash": null,
+          "inlineDatum": null,
+          "referenceScript": null,
+          "value": {
+            "lovelace": 2000000
+          }
+        },
+        "0bd8311167aba722516deea66ca858419d6c4c55262392592550016b15fcf325#1": {
+          "address": "addr_test1vp5cxztpc6hep9ds7fjgmle3l225tk8ske3rmwr9adu0m6qchmx5z",
+          "datum": null,
+          "datumhash": null,
+          "inlineDatum": null,
+          "referenceScript": null,
+          "value": {
+            "lovelace": 98000000
+          }
+        },
+        "7b27f432e04984dc21ee61e8b1539775cd72cc8669f72cf39aebf6d87e35c697#0": {
+          "address": "addr_test1vp0yug22dtwaxdcjdvaxr74dthlpunc57cm639578gz7algset3fh",
+          "datum": null,
+          "datumhash": null,
+          "inlineDatum": null,
+          "referenceScript": null,
+          "value": {
+            "lovelace": 50000000
+          }
+        },
+        "f0a39560ea80ccc68e8dffb6a4a077c8927811f06c5d9058d0fa2d1a8d047d20#0": {
+          "address": "addr_test1vqx5tu4nzz5cuanvac4t9an4djghrx7hkdvjnnhstqm9kegvm6g6c",
+          "datum": null,
+          "datumhash": null,
+          "inlineDatum": null,
+          "referenceScript": null,
+          "value": {
+            "lovelace": 25000000
+          }
+        }
+      },
+      "utxoToDecommit": null,
+      "version": 0
+    },
+    "tag": "SnapshotConfirmed"
+  }
