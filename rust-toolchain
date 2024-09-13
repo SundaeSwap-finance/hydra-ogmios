@@ -1,0 +1,4 @@
+[toolchain]
+channel = "nightly-2024-09-12"
+components = [ "cargo", "rustc", "rustc-dev" ]
+targets = [ "x86_64-unknown-linux-gnu" ]
