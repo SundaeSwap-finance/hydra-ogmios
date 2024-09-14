@@ -6,7 +6,6 @@ use derivative::Derivative;
 use pallas::{
     codec::{
         minicbor::{self, encode},
-        utils::KeepRaw,
         utils::PositiveCoin,
     },
     crypto::hash::Hash,
@@ -15,7 +14,7 @@ use pallas::{
         primitives::{
             conway::Value as ConwayValue,
             conway::{
-                BigInt, Constr, NativeScript, PlutusData, PolicyId, PseudoDatumOption,
+                BigInt, Constr, PlutusData, PolicyId, PseudoDatumOption,
                 PseudoScript, PostAlonzoTransactionOutput,
             },
         },
