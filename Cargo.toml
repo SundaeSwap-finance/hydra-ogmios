@@ -15,3 +15,4 @@ pallas-primitives = "0.30.2"
 minicbor = { version = "0.20", features = ["std", "half", "derive"] }
 anyhow = "1.0.88"
 derivative = "2.2.0"
+tungstenite = "0.24.0"

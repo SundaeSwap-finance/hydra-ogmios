@@ -10,6 +10,11 @@ mod utxo;
 use crate::snapshot_confirmed::SnapshotConfirmed;
 use crate::ogmios::Ogmios;
 
+use std::sync::{Arc, Mutex};
+use std::net::TcpListener;
+use std::thread::spawn;
+use tungstenite::{Message, accept};
+
 // src/Hydra/Events.hs 'StateEvent'
 // This is the type sent to EventSinks.
 #[allow(dead_code)]
@@ -39,6 +44,13 @@ struct TransactionReceivedTx {
 enum StateChanged {
     TransactionReceived(TransactionReceived),
     SnapshotConfirmed(SnapshotConfirmed),
+    HeadInitialized,
+    CommittedUTxO,
+    TickObserved,
+    HeadOpened,
+    TransactionAppliedToLocalUTxO,
+    SnapshotRequested,
+    PartySignedSnapshot,
 }
 
 impl TryFrom<Value> for Event {
@@ -95,6 +107,13 @@ impl TryFrom<Value> for StateChanged {
             "TransactionReceived" => {
                 TransactionReceived::try_from(value).map(StateChanged::TransactionReceived)
             }
+            "HeadInitialized" => Ok(StateChanged::HeadInitialized),
+            "CommittedUTxO" => Ok(StateChanged::CommittedUTxO),
+            "TickObserved" => Ok(StateChanged::TickObserved),
+            "HeadOpened" => Ok(StateChanged::HeadOpened),
+            "TransactionAppliedToLocalUTxO" => Ok(StateChanged::TransactionAppliedToLocalUTxO),
+            "SnapshotRequested" => Ok(StateChanged::SnapshotRequested),
+            "PartySignedSnapshot" => Ok(StateChanged::PartySignedSnapshot),
             _ => Err(anyhow!("Unimplemented variant: {:?}", value)),
         }
     }
@@ -102,6 +121,7 @@ impl TryFrom<Value> for StateChanged {
 
 trait Source {
     fn read(&mut self) -> anyhow::Result<&[u8]>;
+    fn done(&self) -> bool;
 }
 
 struct UdpSource {
@@ -111,9 +131,12 @@ struct UdpSource {
 
 impl Source for UdpSource {
     fn read(&mut self) -> anyhow::Result<&[u8]> {
-        let (amt, src) = self.socket.recv_from(&mut self.buf)?;
+        let (amt, _src) = self.socket.recv_from(&mut self.buf)?;
         let msg = &mut self.buf[..amt];
         Ok(msg)
+    }
+    fn done(&self) -> bool {
+        false
     }
 }
 
@@ -131,32 +154,99 @@ impl Source for StaticSource {
         self.index += 1;
         Ok(&result)
     }
-}
-
-fn listen<T: Source>(source: &mut T) -> anyhow::Result<()> {
-    let mut ogmios = Ogmios::new();
-    loop {
-        let msg = source.read()?;
-        let v: Value = serde_json::from_slice(&msg)?;
-        let e: Event = Event::try_from(v.clone())?;
-        match ogmios_consume_event(&mut ogmios, e) {
-            Ok(()) => {
-                println!("ogmios consumed hydra event");
-            }
-            Err(err) => {
-                println!("ogmios: error consuming hydra event: {}", err);
-            }
-        }
+    fn done(&self) -> bool {
+        self.index >= self.contents.len()
     }
 }
 
-fn ogmios_consume_event(ogmios: &mut Ogmios, e: Event) -> anyhow::Result<()> {
+enum ChainsyncRequest {
+    NextBlock,
+}
+
+impl TryFrom<Value> for ChainsyncRequest {
+    type Error = anyhow::Error;
+
+    fn try_from(value: Value) -> Result<Self, Self::Error> {
+        let jsonrpc = value["jsonrpc"].as_str().context("Invalid jsonrpc")?;
+        let method = value["method"].as_str().context("Invalid method")?;
+        if jsonrpc != "2.0" {
+            return Err(anyhow!("unexpected jsonrpc: {}; expected \"2.0\"", jsonrpc));
+        }
+        if method != "nextBlock" {
+            return Err(anyhow!("unexpected chainsync request: {}; expected \"nextBlock\"", method));
+        }
+        Ok(ChainsyncRequest::NextBlock)
+    }
+}
+
+fn listen<T: Source>(source: &mut T) -> anyhow::Result<()> {
+    let ogmios = Arc::new(Mutex::new(Ogmios::new()));
+    let ogmios_ref = ogmios.clone();
+    spawn(move || {
+        let server = TcpListener::bind("127.0.0.1:9001").unwrap();
+        for stream in server.incoming() {
+            let ogmios = ogmios_ref.clone();
+            spawn(move || {
+                let mut websocket = accept(stream.unwrap()).unwrap();
+                loop {
+                    let msg = websocket.read().unwrap();
+
+                    // We do not want to send back ping/pong messages.
+                    if msg.is_binary() || msg.is_text() {
+                        let bytes = msg.into_data();
+                        let v: Result<Value, _> = serde_json::from_slice(&bytes);
+                        match v {
+                            Ok(v) => {
+                                let chainsync_request = ChainsyncRequest::try_from(v);
+                                match chainsync_request {
+                                    Ok(req) => {
+                                        websocket.send(Message::Text("next block".to_string())).unwrap()
+                                    }
+                                    Err(e) => {
+                                        websocket.send(Message::Text(format!("couldn't parse request: {:?}", e))).unwrap()
+                                    }
+                                }
+                            }
+                            Err(e) => {
+                                websocket.send(Message::Text(format!("couldn't parse request as json: {:?}", e))).unwrap()
+                            }
+                        }
+                    }
+                }
+            });
+        }
+    });
+    while !source.done() {
+        let msg = source.read()?;
+        let v: Value = serde_json::from_slice(&msg)?;
+        let e: Event = Event::try_from(v.clone())?;
+        let mut o = ogmios.lock().unwrap();
+        match ogmios_consume_event(&mut o, e) {
+            Ok(msg) => {
+                println!("{:?}", msg);
+            }
+            Err(err) => {
+                return Err(anyhow!("ogmios: error consuming hydra event: {}", err))
+            }
+        }
+    }
+    Ok(())
+}
+
+#[derive(Debug)]
+enum OgmiosMessage {
+    Message(String),
+    NoMessage,
+}
+
+fn ogmios_consume_event(ogmios: &mut Ogmios, e: Event) -> anyhow::Result<OgmiosMessage> {
     match e.state_changed {
         StateChanged::TransactionReceived(transaction_received) => {
             let cbor_hex = transaction_received.tx.cbor_hex;
             let tx_cbor_raw = hex::decode(cbor_hex)?;
             let tx: Tx = minicbor::decode(&tx_cbor_raw[..])?;
             ogmios.add_transaction(&transaction_received.tx.tx_id, tx);
+            Ok(OgmiosMessage::Message("added tx".to_string()))
         },
         StateChanged::SnapshotConfirmed(snapshot_confirmed) => {
             let mut tx_ids = vec![];
@@ -165,16 +255,18 @@ fn ogmios_consume_event(ogmios: &mut Ogmios, e: Event) -> anyhow::Result<()> {
                 tx_ids.push(tx_id_hex);
             }
             match ogmios.new_block(&tx_ids) {
-                Ok(new_txes) => {
-                    println!("new txes: {:?}", new_txes)
+                Ok(()) => {
+                    Ok(OgmiosMessage::Message("new block".to_string()))
                 }
                 Err(e) => {
-                    return Err(anyhow!("hydra-ogmios new_block failed: {}", e))
+                    Err(anyhow!("hydra-ogmios new_block failed: {}", e))
                 }
             }
         },
+        _ => {
+           Ok(OgmiosMessage::Message("nothing to do".to_string()))
+        },
     }
-    Ok(())
 }
 
 fn main() {
@@ -221,5 +313,23 @@ mod tests {
         let result: Event = Event::try_from(v)
             .expect("couldn't parse event");
         print!("SnapshotConfirmed: {:?}", result);
+    }
+
+    #[test]
+    fn ogmios_handle_events() {
+        let events = fs::read_to_string("testdata/events")
+            .expect("couldn't read file");
+        let lines = events.lines().map(|s| s.as_bytes().to_vec()).collect();
+        let mut source = StaticSource{
+            contents: lines,
+            index: 0,
+        };
+        match listen(&mut source) {
+            Ok(()) => {
+            },
+            Err(e) => {
+                panic!("{}", e)
+            },
+        }
     }
 }

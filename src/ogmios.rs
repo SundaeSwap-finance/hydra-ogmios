@@ -4,12 +4,18 @@ use std::collections::HashMap;
 
 pub struct Ogmios {
     mempool: HashMap<String, Tx>,
+    blocks: Vec<Block>,
+}
+
+pub struct Block {
+    transactions: Vec<Tx>,
 }
 
 impl Ogmios {
     pub fn new() -> Ogmios {
         Ogmios{
             mempool: HashMap::new(),
+            blocks: vec![],
         }
     }
 
@@ -17,19 +23,22 @@ impl Ogmios {
         self.mempool.insert(tx_id.clone(), tx);
     }
 
-    pub fn new_block(&mut self, hashes: &Vec<String>) -> Result<Vec<Tx>, anyhow::Error> {
-        let mut block_transactions = vec![];
+    pub fn new_block(&mut self, hashes: &Vec<String>) -> Result<(), anyhow::Error> {
+        let mut block = vec![];
         for hash in hashes {
             match self.mempool.remove(hash) {
                 Some(tx_in_block) => {
-                    block_transactions.push(tx_in_block);
+                    block.push(tx_in_block);
                 }
                 None => {
                     return Err(anyhow!("tx with hash {} was not found", &hash))
                 }
             }
         }
-        Ok(block_transactions)
+        self.blocks.push(Block{
+            transactions: block,
+        });
+        Ok(())
     }
 }
 
@@ -48,7 +57,7 @@ mod tests {
         let tx_1 = minicbor::decode(&tx_1_bytes).unwrap();
         let mut ogmios = Ogmios::new();
         ogmios.add_transaction(&tx_hash_1, tx_1);
-        match ogmios.new_block(vec![&tx_hash_1]) {
+        match ogmios.new_block(&vec![tx_hash_1]) {
             Ok(_txes) => {
             }
             Err(e) => {
