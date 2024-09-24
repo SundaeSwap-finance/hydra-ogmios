@@ -1,14 +1,17 @@
 use anyhow::{Context, anyhow};
 use pallas_primitives::conway::{Tx};
 use serde_json::{Value};
+use serde_json::json;
 use std::net::UdpSocket;
 
 mod ogmios;
+mod encode;
 mod snapshot_confirmed;
 mod utxo;
 
 use crate::snapshot_confirmed::SnapshotConfirmed;
-use crate::ogmios::Ogmios;
+use crate::ogmios::{Block, Ogmios};
+use crate::encode::{encode_json_tx};
 
 use std::sync::{Arc, Mutex};
 use std::net::TcpListener;
@@ -51,6 +54,7 @@ enum StateChanged {
     TransactionAppliedToLocalUTxO,
     SnapshotRequested,
     PartySignedSnapshot,
+    Unimplemented,
 }
 
 impl TryFrom<Value> for Event {
@@ -114,7 +118,7 @@ impl TryFrom<Value> for StateChanged {
             "TransactionAppliedToLocalUTxO" => Ok(StateChanged::TransactionAppliedToLocalUTxO),
             "SnapshotRequested" => Ok(StateChanged::SnapshotRequested),
             "PartySignedSnapshot" => Ok(StateChanged::PartySignedSnapshot),
-            _ => Err(anyhow!("Unimplemented variant: {:?}", value)),
+            _ => Ok(StateChanged::Unimplemented),
         }
     }
 }
@@ -127,6 +131,15 @@ trait Source {
 struct UdpSource {
     socket: UdpSocket,
     buf: [u8; 1048576]
+}
+
+impl UdpSource {
+    fn new(socket: UdpSocket) -> UdpSource {
+        UdpSource {
+            socket: socket,
+            buf: [0; 1048576],
+        }
+    }
 }
 
 impl Source for UdpSource {
@@ -179,14 +192,40 @@ impl TryFrom<Value> for ChainsyncRequest {
     }
 }
 
+#[derive(Debug)]
+struct NextBlockResponse {
+    block: Block,
+}
+
+impl NextBlockResponse {
+    fn new(block: Block) -> NextBlockResponse {
+        NextBlockResponse{
+            block: block,
+        }
+    }
+}
+
+pub fn encode_next_block_response(x: &NextBlockResponse) -> Value {
+    json!({
+        "direction": "forward",
+        "tip": json!({
+            "slot": 0,
+        }),
+        "block": json!({
+            "transactions": x.block.transactions.iter().map(|(hash, tx)| encode_json_tx(hash, &tx)).collect::<Vec<_>>(),
+        }),
+    })
+}
+
 fn listen<T: Source>(source: &mut T) -> anyhow::Result<()> {
     let ogmios = Arc::new(Mutex::new(Ogmios::new()));
-    let ogmios_ref = ogmios.clone();
+    let ogmios_ref = Arc::clone(&ogmios);
     spawn(move || {
         let server = TcpListener::bind("127.0.0.1:9001").unwrap();
         for stream in server.incoming() {
-            let ogmios = ogmios_ref.clone();
+            let ogmios = Arc::clone(&ogmios_ref);
             spawn(move || {
+                let mut cursor = 0;
                 let mut websocket = accept(stream.unwrap()).unwrap();
                 loop {
                     let msg = websocket.read().unwrap();
@@ -199,8 +238,17 @@ fn listen<T: Source>(source: &mut T) -> anyhow::Result<()> {
                             Ok(v) => {
                                 let chainsync_request = ChainsyncRequest::try_from(v);
                                 match chainsync_request {
-                                    Ok(req) => {
-                                        websocket.send(Message::Text("next block".to_string())).unwrap()
+                                    Ok(_req) => {
+                                        loop {
+                                            let ogmios = ogmios.lock().unwrap();
+                                            if let Some(has_block) = ogmios.get_block(cursor) {
+                                                let response = NextBlockResponse::new(has_block.clone());
+                                                let response_json = encode_next_block_response(&response);
+                                                cursor += 1;
+                                                websocket.send(Message::Text(response_json.to_string())).unwrap();
+                                                break;
+                                            }
+                                        }
                                     }
                                     Err(e) => {
                                         websocket.send(Message::Text(format!("couldn't parse request: {:?}", e))).unwrap()
@@ -230,6 +278,7 @@ fn listen<T: Source>(source: &mut T) -> anyhow::Result<()> {
             }
         }
     }
+    // TODO: wait on all websocket connections
     Ok(())
 }
 
@@ -270,7 +319,9 @@ fn ogmios_consume_event(ogmios: &mut Ogmios, e: Event) -> anyhow::Result<OgmiosM
 }
 
 fn main() {
-    println!("Hello, world!");
+    let udp_socket = UdpSocket::bind("127.0.0.1:23457").expect("couldn't bind to udp");
+    let mut source = UdpSource::new(udp_socket);
+    listen(&mut source).expect("died")
 }
 
 #[cfg(test)]

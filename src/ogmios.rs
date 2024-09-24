@@ -7,8 +7,9 @@ pub struct Ogmios {
     blocks: Vec<Block>,
 }
 
+#[derive(Clone, Debug)]
 pub struct Block {
-    transactions: Vec<Tx>,
+    pub transactions: Vec<(String, Tx)>,
 }
 
 impl Ogmios {
@@ -21,6 +22,7 @@ impl Ogmios {
 
     pub fn add_transaction(&mut self, tx_id: &String, tx: Tx) {
         self.mempool.insert(tx_id.clone(), tx);
+        println!("inserted txid: {}", tx_id)
     }
 
     pub fn new_block(&mut self, hashes: &Vec<String>) -> Result<(), anyhow::Error> {
@@ -28,10 +30,11 @@ impl Ogmios {
         for hash in hashes {
             match self.mempool.remove(hash) {
                 Some(tx_in_block) => {
-                    block.push(tx_in_block);
+                    println!("found tx in mempool: {}", hash);
+                    block.push((hash.clone(), tx_in_block));
                 }
                 None => {
-                    return Err(anyhow!("tx with hash {} was not found", &hash))
+                    return Err(anyhow!("tx with hash {} was not found in {:?}", &hash, self.mempool.keys().collect::<Vec<_>>()))
                 }
             }
         }
@@ -39,6 +42,14 @@ impl Ogmios {
             transactions: block,
         });
         Ok(())
+    }
+
+    pub fn get_block(&self, index: usize) -> Option<&Block> {
+        if index >= self.blocks.len() {
+            None
+        } else {
+            Some(&self.blocks[index])
+        }
     }
 }
 
