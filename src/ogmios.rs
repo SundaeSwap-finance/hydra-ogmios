@@ -1,6 +1,7 @@
 use anyhow::anyhow;
 use pallas_primitives::conway::{Tx};
 use std::collections::HashMap;
+use blake2::{Blake2b512, Digest};
 
 pub struct Ogmios {
     mempool: HashMap<String, Tx>,
@@ -9,6 +10,9 @@ pub struct Ogmios {
 
 #[derive(Clone, Debug)]
 pub struct Block {
+    pub height: u64,
+    pub hash: Vec<u8>,
+    pub time: u64,
     pub transactions: Vec<(String, Tx)>,
 }
 
@@ -25,9 +29,11 @@ impl Ogmios {
         println!("inserted txid: {}", tx_id)
     }
 
-    pub fn new_block(&mut self, hashes: &Vec<String>) -> Result<(), anyhow::Error> {
+    pub fn new_block(&mut self, hashes: &Vec<String>, unix_time: u64) -> Result<(), anyhow::Error> {
         let mut block = vec![];
+        let mut hasher = Blake2b512::new();
         for hash in hashes {
+            hasher.update(hash);
             match self.mempool.remove(hash) {
                 Some(tx_in_block) => {
                     println!("found tx in mempool: {}", hash);
@@ -39,16 +45,19 @@ impl Ogmios {
             }
         }
         self.blocks.push(Block{
+            height: self.blocks.len() as u64,
+            hash: hasher.finalize().to_vec(),
+            time: unix_time,
             transactions: block,
         });
         Ok(())
     }
 
-    pub fn get_block(&self, index: usize) -> Option<&Block> {
+    pub fn get_block(&self, index: usize) -> Option<(&Block, &Block)> {
         if index >= self.blocks.len() {
             None
         } else {
-            Some(&self.blocks[index])
+            Some((&self.blocks[index], &self.blocks[self.blocks.len()-1]))
         }
     }
 }
@@ -68,7 +77,7 @@ mod tests {
         let tx_1 = minicbor::decode(&tx_1_bytes).unwrap();
         let mut ogmios = Ogmios::new();
         ogmios.add_transaction(&tx_hash_1, tx_1);
-        match ogmios.new_block(&vec![tx_hash_1]) {
+        match ogmios.new_block(&vec![tx_hash_1], 0) {
             Ok(_txes) => {
             }
             Err(e) => {

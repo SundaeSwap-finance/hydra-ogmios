@@ -3,6 +3,7 @@ use pallas_primitives::conway::{Tx};
 use serde_json::{Value};
 use serde_json::json;
 use std::net::UdpSocket;
+use std::time::{SystemTime};
 
 mod ogmios;
 mod encode;
@@ -195,24 +196,37 @@ impl TryFrom<Value> for ChainsyncRequest {
 #[derive(Debug)]
 struct NextBlockResponse {
     block: Block,
+    tip: Block,
 }
 
 impl NextBlockResponse {
-    fn new(block: Block) -> NextBlockResponse {
+    fn new(block: Block, tip: Block) -> NextBlockResponse {
         NextBlockResponse{
             block: block,
+            tip: tip
         }
     }
 }
 
 pub fn encode_next_block_response(x: &NextBlockResponse) -> Value {
     json!({
-        "direction": "forward",
-        "tip": json!({
-            "slot": 0,
-        }),
-        "block": json!({
-            "transactions": x.block.transactions.iter().map(|(hash, tx)| encode_json_tx(hash, &tx)).collect::<Vec<_>>(),
+        "jsonrpc": "2.0",
+        "method": "nextBlock",
+        "result": json!({
+            "direction": "forward",
+            "tip": json!({
+                "slot": x.tip.time,
+                "id": hex::encode(&x.tip.hash),
+                "height": x.tip.height,
+            }),
+            "block": json!({
+                "type": "praos",
+                "era": "conway",
+                "id": hex::encode(&x.block.hash),
+                "slot": x.block.time,
+                "height": x.block.height,
+                "transactions": x.block.transactions.iter().map(|(hash, tx)| encode_json_tx(hash, &tx)).collect::<Vec<_>>(),
+            }),
         }),
     })
 }
@@ -241,8 +255,8 @@ fn listen<T: Source>(source: &mut T) -> anyhow::Result<()> {
                                     Ok(_req) => {
                                         loop {
                                             let ogmios = ogmios.lock().unwrap();
-                                            if let Some(has_block) = ogmios.get_block(cursor) {
-                                                let response = NextBlockResponse::new(has_block.clone());
+                                            if let Some((has_block, tip)) = ogmios.get_block(cursor) {
+                                                let response = NextBlockResponse::new(has_block.clone(), tip.clone());
                                                 let response_json = encode_next_block_response(&response);
                                                 cursor += 1;
                                                 websocket.send(Message::Text(response_json.to_string())).unwrap();
@@ -303,7 +317,11 @@ fn ogmios_consume_event(ogmios: &mut Ogmios, e: Event) -> anyhow::Result<OgmiosM
                 let tx_id_hex = hex::encode(tx_id_raw);
                 tx_ids.push(tx_id_hex);
             }
-            match ogmios.new_block(&tx_ids) {
+            let time = match SystemTime::now().duration_since(SystemTime::UNIX_EPOCH) {
+                Ok(n) => n.as_secs(),
+                Err(_) => panic!("SystemTime before UNIX EPOCH!"),
+            };
+            match ogmios.new_block(&tx_ids, time) {
                 Ok(()) => {
                     Ok(OgmiosMessage::Message("new block".to_string()))
                 }
