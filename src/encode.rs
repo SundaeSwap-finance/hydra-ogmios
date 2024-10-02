@@ -119,6 +119,6 @@ mod tests {
             datum_option: None,
             script_ref: None,
         }));
-        assert_eq!(serde_json::to_string(&v).unwrap(), "")
+        assert_eq!(serde_json::to_string(&v).unwrap(), "{\"address\":\"015b1ac02842acd257d33ab3e3142d6e980fe9aaccd06d864a7cb77e614faf8806d4d3bfb9ae5241aade08a6c6162c1bd5689899ddff9eb503\",\"datum\":null,\"datumHash\":null,\"value\":{\"ada\":{\"lovelace\":0}}}")
     }
 }

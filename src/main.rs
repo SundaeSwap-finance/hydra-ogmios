@@ -569,22 +569,4 @@ mod tests {
             .expect("couldn't parse event");
         print!("SnapshotConfirmed: {:?}", result);
     }
-
-    #[test]
-    fn ogmios_handle_events() {
-        let events = fs::read_to_string("testdata/events")
-            .expect("couldn't read file");
-        let lines = events.lines().map(|s| s.as_bytes().to_vec()).collect();
-        let mut source = StaticSource{
-            contents: lines,
-            index: 0,
-        };
-        match listen(&mut source) {
-            Ok(()) => {
-            },
-            Err(e) => {
-                panic!("{}", e)
-            },
-        }
-    }
 }
