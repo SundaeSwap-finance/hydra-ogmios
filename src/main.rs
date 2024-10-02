@@ -1,4 +1,6 @@
 use anyhow::{Context, anyhow};
+use std::collections::HashMap;
+use pallas_traverse::ComputeHash;
 use pallas_primitives::conway::{Tx};
 use serde_json::{Value};
 use serde_json::json;
@@ -16,8 +18,10 @@ use crate::encode::{encode_json_tx};
 
 use std::sync::{Arc, Mutex};
 use std::net::TcpListener;
-use std::thread::spawn;
-use tungstenite::{Message, accept};
+use std::thread;
+use std::thread::{ThreadId, spawn};
+use tungstenite::http::Uri;
+use tungstenite::{connect, ClientRequestBuilder, Message, accept};
 
 // src/Hydra/Events.hs 'StateEvent'
 // This is the type sent to EventSinks.
@@ -175,6 +179,7 @@ impl Source for StaticSource {
 
 enum ChainsyncRequest {
     NextBlock,
+    SubmitTransaction((String, String)),
 }
 
 impl TryFrom<Value> for ChainsyncRequest {
@@ -186,10 +191,46 @@ impl TryFrom<Value> for ChainsyncRequest {
         if jsonrpc != "2.0" {
             return Err(anyhow!("unexpected jsonrpc: {}; expected \"2.0\"", jsonrpc));
         }
-        if method != "nextBlock" {
-            return Err(anyhow!("unexpected chainsync request: {}; expected \"nextBlock\"", method));
+        if method == "nextBlock" {
+            return Ok(ChainsyncRequest::NextBlock)
+        } else if method == "submitTransaction" {
+            let params = value["params"].as_object().context("Invalid params")?;
+            let transaction = params["transaction"].as_object().context("Invalid transaction")?;
+            let cbor = transaction["cbor"].as_str().context("Invalid cbor")?;
+            let tx_cbor_raw = hex::decode(cbor)?;
+            let tx: Tx = minicbor::decode(&tx_cbor_raw[..])?;
+            let hash = tx.transaction_body.compute_hash();
+            return Ok(ChainsyncRequest::SubmitTransaction((hex::encode(&hash), cbor.to_string())))
+        } else {
+            return Err(anyhow!("unexpected chainsync request: {}", method));
         }
-        Ok(ChainsyncRequest::NextBlock)
+    }
+}
+
+enum HydraWsMessage {
+    TxValid(String),
+    TxInvalid((String, String)),
+    Unimplemented(String),
+}
+
+impl TryFrom<Value> for HydraWsMessage {
+    type Error = anyhow::Error;
+
+    fn try_from(value: Value) -> Result<Self, Self::Error> {
+        let tag = value["tag"].as_str().context("Invalid tag")?;
+        if tag == "TxValid" {
+            let transaction = value["transaction"].as_object().context("Invalid transaction")?;
+            let tx_id = transaction["txId"].as_str().context("Invalid txId")?;
+            return Ok(HydraWsMessage::TxValid(tx_id.to_string()));
+        } else if tag == "TxInvalid" {
+            let transaction = value["transaction"].as_object().context("Invalid transaction")?;
+            let tx_id = transaction["txId"].as_str().context("Invalid txId")?;
+            let validation_error = value["validationError"].as_object().context("Invalid validationError")?;
+            let reason = validation_error["reason"].as_str().context("Invalid reason")?;
+            return Ok(HydraWsMessage::TxInvalid((tx_id.to_string(), reason.to_string())));
+        } else {
+            return Ok(HydraWsMessage::Unimplemented(tag.to_string()));
+        }
     }
 }
 
@@ -232,13 +273,117 @@ pub fn encode_next_block_response(x: &NextBlockResponse) -> Value {
 }
 
 fn listen<T: Source>(source: &mut T) -> anyhow::Result<()> {
+    // Hydra client thread, for submitting transactions from ogmios client to hydra node
+    let uri: Uri = "ws://127.0.0.1:4001".parse().unwrap();
+    let builder = ClientRequestBuilder::new(uri);
+    let (mut socket, _) = connect(builder).unwrap();
+    let hydra_client_queue = Arc::new(Mutex::new(Vec::<(ThreadId, String, String)>::new()));
+    let hydra_client_send_queue = hydra_client_queue.clone();
+    let hydra_submittx_mailbox = Arc::new(Mutex::new(HashMap::new()));
+    let hydra_submittx_mailbox_1 = Arc::clone(&hydra_submittx_mailbox);
+    spawn(move || {
+        let mut tx_submit_tasks = HashMap::new();
+        loop {
+            let mut should_read = false;
+            {
+                let mut send = hydra_client_send_queue.lock().unwrap();
+                if let Some((thread_id, tx_id, msg)) = send.pop() {
+                    println!("got request for txsubmit to hydra via ogmios: {:?} {:?} {:?}", thread_id, tx_id, msg);
+                    let message = Message::text(msg);
+                    socket.send(message).unwrap();
+                    should_read = true;
+                    // We are awaiting a confirmation on this tx submission
+                    tx_submit_tasks.insert(tx_id.to_string(), thread_id);
+                }
+            }
+            // Read all responses
+            if !should_read {
+                continue;
+            }
+            while let Ok(msg) = socket.read() {
+                if !should_read {
+                    break;
+                }
+                println!("recieved hydra ws message: {:?}", msg);
+                if msg.is_binary() || msg.is_text() {
+                    let bytes = msg.into_data();
+                    let v: Result<Value, _> = serde_json::from_slice(&bytes);
+                    match v {
+                        Ok(v) => {
+                            println!("hydra ws message incoming: {:?}", v.to_string());
+                            let hydra_ws_message = HydraWsMessage::try_from(v);
+                            match hydra_ws_message {
+                                Ok(HydraWsMessage::TxValid(txid)) => {
+                                    // FIXME: we should probably have a vec of submit tasks per
+                                    // thread id instead of just one so that an ogmios client can
+                                    // do multiple tx submissions without waiting for us to respond
+                                    if let Some(thread_id) = tx_submit_tasks.remove(&txid.to_string()) {
+                                        println!("got txvalid: {:?}", txid);
+                                        should_read = false;
+                                        // Send back the response from hydra for this txid
+                                        // submission
+                                        let response = json!({
+                                            "jsonrpc": "2.0",
+                                            "method": "submitTransaction",
+                                            "result": json!({
+                                                "transaction": json!({
+                                                    "id": txid,
+                                                }),
+                                            }),
+                                        });
+                                        let mut mailbox = hydra_submittx_mailbox_1.lock().unwrap();
+                                        mailbox.insert(thread_id, response);
+                                    }
+                                }
+                                Ok(HydraWsMessage::TxInvalid((txid, error))) => {
+                                    if let Some(thread_id) = tx_submit_tasks.remove(&txid.to_string()) {
+                                        println!("got txinvalid: {:?}", txid);
+                                        should_read = false;
+                                        let response = json!({
+                                            "jsonrpc": "2.0",
+                                            "method": "submitTransaction",
+                                            "result": json!({
+                                                "error": json!({
+                                                    "code": json!(null),
+                                                    "message": error,
+                                                    "data": json!(null),
+                                                }),
+                                            }),
+                                        });
+                                        let mut mailbox = hydra_submittx_mailbox_1.lock().unwrap();
+                                        mailbox.insert(thread_id, response);
+                                    }
+                                }
+                                Ok(HydraWsMessage::Unimplemented(_)) => {
+                                    // We don't care about any other hydra ws messages
+                                }
+                                Err(_) => {
+                                    // We don't really care if we get some data we can't parse
+                                }
+                            }
+                        },
+                        Err(_) => {
+                            // We don't care if the message doesn't even parse as json
+                        }
+                    }
+                }
+            }
+        }
+    });
+
+    // Ogmios server
     let ogmios = Arc::new(Mutex::new(Ogmios::new()));
     let ogmios_ref = Arc::clone(&ogmios);
+    let hydra_client_receive_queue = hydra_client_queue.clone();
+    let hydra_submittx_mailbox_ogmios = Arc::clone(&hydra_submittx_mailbox);
     spawn(move || {
         let server = TcpListener::bind("127.0.0.1:9001").unwrap();
         for stream in server.incoming() {
             let ogmios = Arc::clone(&ogmios_ref);
+            let hydra_client_receive_queue = Arc::clone(&hydra_client_receive_queue);
+            let hydra_submittx_mailbox_ogmios = Arc::clone(&hydra_submittx_mailbox_ogmios);
             spawn(move || {
+                let my_thread_id = thread::current().id();
                 let mut cursor = 0;
                 let mut websocket = accept(stream.unwrap()).unwrap();
                 loop {
@@ -252,7 +397,7 @@ fn listen<T: Source>(source: &mut T) -> anyhow::Result<()> {
                             Ok(v) => {
                                 let chainsync_request = ChainsyncRequest::try_from(v);
                                 match chainsync_request {
-                                    Ok(_req) => {
+                                    Ok(ChainsyncRequest::NextBlock) => {
                                         loop {
                                             let ogmios = ogmios.lock().unwrap();
                                             if let Some((has_block, tip)) = ogmios.get_block(cursor) {
@@ -260,6 +405,29 @@ fn listen<T: Source>(source: &mut T) -> anyhow::Result<()> {
                                                 let response_json = encode_next_block_response(&response);
                                                 cursor += 1;
                                                 websocket.send(Message::Text(response_json.to_string())).unwrap();
+                                                break;
+                                            }
+                                        }
+                                    }
+                                    Ok(ChainsyncRequest::SubmitTransaction((tx_id, cbor_hex))) => {
+                                        println!("got ogmios request for txsubmit: {:?} {:?} {:?}", my_thread_id, tx_id, cbor_hex);
+                                        let submit_tx = json!({
+                                            "tag": "NewTx",
+                                            "transaction": json!({
+                                                "cborHex": cbor_hex,
+                                            }),
+                                        });
+                                        {
+                                            let mut rcv = hydra_client_receive_queue.lock().unwrap();
+                                            rcv.push((my_thread_id, tx_id, submit_tx.to_string()));
+                                        }
+                                        // Await response from hydra node
+                                        println!("await response from hydra node comm thread");
+                                        loop {
+                                            let mut mailbox = hydra_submittx_mailbox_ogmios.lock().unwrap();
+                                            if let Some(response) = mailbox.remove(&my_thread_id) {
+                                                println!("got response from hydra node comm thread: {:?}", response);
+                                                websocket.send(Message::Text(response.to_string())).unwrap();
                                                 break;
                                             }
                                         }
@@ -278,6 +446,8 @@ fn listen<T: Source>(source: &mut T) -> anyhow::Result<()> {
             });
         }
     });
+
+    // Hydra udp sink reader
     while !source.done() {
         let msg = source.read()?;
         let v: Value = serde_json::from_slice(&msg)?;
@@ -292,6 +462,7 @@ fn listen<T: Source>(source: &mut T) -> anyhow::Result<()> {
             }
         }
     }
+
     // TODO: wait on all websocket connections
     Ok(())
 }
@@ -350,6 +521,21 @@ mod tests {
     use hex;
     use serde_json::{Value};
     use std::fs;
+
+    #[test]
+    fn parse_submit_transaction() {
+        let tx2 = fs::read_to_string("testdata/tx_2")
+            .expect("couldn't read file");
+        let v: Value = serde_json::from_str(&tx2)
+            .expect("couldn't parse tx as Value");
+        let result: ChainsyncRequest = ChainsyncRequest::try_from(v)
+            .expect("couldn't parse Value as ChainsyncRequest");
+        if let ChainsyncRequest::SubmitTransaction((txid, _)) = result {
+            assert_eq!(txid, "70289f45472d02e96ba160f9b3fa7144ef67c23bd1bcedb19c4fed8e48c806c5");
+        } else {
+            panic!("incorrect variant");
+        }
+    }
 
     #[test]
     fn transaction_received_can_parse_json() {

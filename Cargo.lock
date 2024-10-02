@@ -667,6 +667,7 @@ dependencies = [
  "pallas",
  "pallas-codec",
  "pallas-primitives",
+ "pallas-traverse",
  "serde",
  "serde_json",
  "tungstenite",
