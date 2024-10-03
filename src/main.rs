@@ -354,7 +354,6 @@ async fn listen() -> anyhow::Result<()> {
                 if let Some((thread_id, tx_id, msg)) = send.pop() {
                     println!("got request for txsubmit to hydra via ogmios: {:?} {:?} {:?}", thread_id, tx_id, msg);
                     let message = Message::text(msg);
-                    println!("sending message to the hydra node now");
                     hydra_node_write.send(message).await.unwrap();
                     // We are awaiting a confirmation on this tx submission
                     tx_submit_tasks_1.lock().await.insert(tx_id.to_string(), thread_id);
@@ -364,7 +363,6 @@ async fn listen() -> anyhow::Result<()> {
     });
     let handle = tokio::spawn(async move {
         loop {
-            println!("awaiting message from the hydra node");
             let msg = hydra_node_read.next().await.unwrap().unwrap();
             if msg.is_binary() || msg.is_text() {
                 let bytes = msg.into_data();
@@ -553,7 +551,12 @@ async fn listen() -> anyhow::Result<()> {
                         awaiting_next_block: 0,
                     });
                     loop {
-                        let msg = receiver.next().await.unwrap().unwrap();
+                        let msg_maybe = receiver.next().await.unwrap();
+                        if let Err(e) = msg_maybe {
+                            println!("disconnected");
+                            return;
+                        }
+                        let msg = msg_maybe.unwrap();
 
                         // We do not want to send back ping/pong messages.
                         if msg.is_binary() || msg.is_text() {
