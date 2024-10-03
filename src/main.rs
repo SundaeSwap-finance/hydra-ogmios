@@ -317,6 +317,7 @@ fn encode_next_block_response(x: &NextBlockResponse) -> Value {
 enum ChainSyncEvent {
     NotifyNextBlock,
     RequestNextBlock,
+    ReceivedTxStatus,
 }
 
 struct ChainSyncClient {
@@ -446,6 +447,7 @@ async fn listen() -> anyhow::Result<()> {
                                     });
                                     let mut mailbox = hydra_submittx_mailbox_1.lock().await;
                                     mailbox.insert(thread_id, response);
+                                    send_mutex_1.lock().await.send(ChainSyncEvent::ReceivedTxStatus);
                                 }
                             }
                             Ok(HydraWsMessage::TxInvalid((txid, error))) => {
@@ -464,6 +466,7 @@ async fn listen() -> anyhow::Result<()> {
                                     });
                                     let mut mailbox = hydra_submittx_mailbox_1.lock().await;
                                     mailbox.insert(thread_id, response);
+                                    send_mutex_1.lock().await.send(ChainSyncEvent::ReceivedTxStatus);
                                 }
                             }
                             Ok(HydraWsMessage::Unimplemented(_)) => {
@@ -482,9 +485,11 @@ async fn listen() -> anyhow::Result<()> {
         }
     });
 
-    let clients = Arc::new(Mutex::new(HashMap::<ThreadId, ChainSyncClient>::new())); // map of client send sinks
+    // map of client send sinks
+    let clients = Arc::new(Mutex::new(HashMap::<ThreadId, ChainSyncClient>::new()));
 
     let sender_clients_ref = Arc::clone(&clients);
+    let sender_mailbox_ref = Arc::clone(&hydra_submittx_mailbox);
     // chainsync sender thread
     tokio::spawn(async move {
         loop {
@@ -496,12 +501,14 @@ async fn listen() -> anyhow::Result<()> {
                 }
                 Some(ChainSyncEvent::RequestNextBlock) => {
                 }
-                Some(_) => {
+                Some(ChainSyncEvent::ReceivedTxStatus) => {
                 }
             }
             let mut sender_clients = sender_clients_ref.lock().await;
-            let mut clients = sender_clients.values_mut();
-            for client in clients {
+            for (client_id, client) in sender_clients.iter_mut() {
+                if let Some(response) = sender_mailbox_ref.lock().await.remove(&client_id) {
+                    client.sender.send(Message::Text(response.to_string())).await;
+                }
                 if client.awaiting_next_block > 0 {
                     if let Some((has_block, tip)) = sender_ogmios_ref.lock().await.get_block(client.cursor) {
                         let response = NextBlockResponse::new(has_block.clone(), tip.clone());
@@ -512,7 +519,6 @@ async fn listen() -> anyhow::Result<()> {
                     }
                 }
             }
-
         }
     });
 
@@ -562,31 +568,19 @@ async fn listen() -> anyhow::Result<()> {
                                             }
                                             send.lock().await.send(ChainSyncEvent::RequestNextBlock);
                                         }
-                                        //Ok(ChainsyncRequest::SubmitTransaction((tx_id, cbor_hex))) => {
-                                        //    println!("got ogmios request for txsubmit: {:?} {:?} {:?}", my_thread_id, tx_id, cbor_hex);
-                                        //    let submit_tx = json!({
-                                        //        "tag": "NewTx",
-                                        //        "transaction": json!({
-                                        //            "cborHex": cbor_hex,
-                                        //        }),
-                                        //    });
-                                        //    {
-                                        //        let mut rcv = hydra_client_receive_queue.lock().await;
-                                        //        rcv.push((my_thread_id, tx_id, submit_tx.to_string()));
-                                        //    }
-                                        //    // Await response from hydra node
-                                        //    println!("await response from hydra node comm thread");
-                                        //    loop {
-                                        //        let mut mailbox = hydra_submittx_mailbox_ogmios.lock().await;
-                                        //        if let Some(response) = mailbox.remove(&my_thread_id) {
-                                        //            println!("got response from hydra node comm thread: {:?}", response);
-                                        //            sender.send(Message::Text(response.to_string())).await;
-                                        //            break;
-                                        //        }
-                                        //    }
-                                        //}
-                                        Ok(ChainsyncRequest::SubmitTransaction(_)) => {
-                                            todo!()
+                                        Ok(ChainsyncRequest::SubmitTransaction((tx_id, cbor_hex))) => {
+                                            println!("got ogmios request for txsubmit: {:?} {:?} {:?}", my_thread_id, tx_id, cbor_hex);
+                                            let submit_tx = json!({
+                                                "tag": "NewTx",
+                                                "transaction": json!({
+                                                    "cborHex": cbor_hex,
+                                                }),
+                                            });
+                                            {
+                                                let mut rcv = hydra_client_receive_queue.lock().await;
+                                                rcv.push((my_thread_id, tx_id, submit_tx.to_string()));
+                                            }
+                                            println!("await response from hydra node comm thread");
                                         }
                                         Ok(ChainsyncRequest::FindIntersection(points)) => {
                                                 let ogmios = ogmios.lock().await;
