@@ -1,4 +1,4 @@
-use anyhow::{Context, anyhow};
+use anyhow::{Context, Result, anyhow};
 use std::collections::HashMap;
 use pallas_traverse::ComputeHash;
 use pallas_primitives::conway::{Tx};
@@ -177,9 +177,35 @@ impl Source for StaticSource {
     }
 }
 
+enum Point {
+    Point((u64, String)),
+    Origin,
+}
+
+impl TryFrom<Value> for Point {
+    type Error = anyhow::Error;
+
+    fn try_from(value: Value) -> Result<Self, Self::Error> {
+        if let Some(object) = value.as_object() {
+            let slot = value["slot"].as_u64().context("Invalid slot")?;
+            let id = value["id"].as_str().context("Invalid id")?;
+            return Ok(Point::Point((slot, id.to_string())))
+        } else if let Some(string) = value.as_str() {
+            if string == "origin" {
+                return Ok(Point::Origin)
+            } else {
+                return Err(anyhow!("unexpected point string: {}; expected \"origin\"", string));
+            }
+        } else {
+            return Err(anyhow!("unexpected point: expected object or string: {}", value));
+        }
+    }
+}
+
 enum ChainsyncRequest {
     NextBlock,
     SubmitTransaction((String, String)),
+    FindIntersection(Vec<Point>),
 }
 
 impl TryFrom<Value> for ChainsyncRequest {
@@ -201,6 +227,12 @@ impl TryFrom<Value> for ChainsyncRequest {
             let tx: Tx = minicbor::decode(&tx_cbor_raw[..])?;
             let hash = tx.transaction_body.compute_hash();
             return Ok(ChainsyncRequest::SubmitTransaction((hex::encode(&hash), cbor.to_string())))
+        } else if method == "findIntersection" {
+            let params = value["params"].as_object().context("Invalid params")?;
+            let points = params["points"].as_array().context("Invalid points")?;
+            let points = points.iter().map(|p| Point::try_from(p.clone()))
+                .collect::<Result<Vec<Point>>>()?;
+            return Ok(ChainsyncRequest::FindIntersection(points))
         } else {
             return Err(anyhow!("unexpected chainsync request: {}", method));
         }
@@ -432,6 +464,9 @@ fn listen<T: Source>(source: &mut T) -> anyhow::Result<()> {
                                             }
                                         }
                                     }
+                                    Ok(ChainsyncRequest::FindIntersection(points)) => {
+
+                                    }
                                     Err(e) => {
                                         websocket.send(Message::Text(format!("couldn't parse request: {:?}", e))).unwrap()
                                     }
@@ -568,5 +603,15 @@ mod tests {
         let result: Event = Event::try_from(v)
             .expect("couldn't parse event");
         print!("SnapshotConfirmed: {:?}", result);
+    }
+
+    #[test]
+    fn can_parse_find_intersect() {
+        let find_intersection = fs::read_to_string("testdata/find_intersection.json")
+            .expect("couldn't read file");
+        let v: Value = serde_json::from_str(&find_intersection)
+            .expect("couldn't parse string as json");
+        let result: ChainsyncRequest = ChainsyncRequest::try_from(v)
+            .expect("couldn't parse chainsync request");
     }
 }
