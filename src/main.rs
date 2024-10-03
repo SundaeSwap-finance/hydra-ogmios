@@ -13,7 +13,7 @@ mod snapshot_confirmed;
 mod utxo;
 
 use crate::snapshot_confirmed::SnapshotConfirmed;
-use crate::ogmios::{Block, Ogmios};
+use crate::ogmios::{FindIntersection, Block, Ogmios, Point, encode_point};
 use crate::encode::{encode_json_tx};
 
 use std::sync::{Arc, Mutex};
@@ -158,50 +158,6 @@ impl Source for UdpSource {
     }
 }
 
-struct StaticSource {
-    contents: Vec<Vec<u8>>,
-    index: usize,
-}
-
-impl Source for StaticSource {
-    fn read(&mut self) -> anyhow::Result<&[u8]> {
-        if self.index >= self.contents.len() {
-            return Err(anyhow!("end of data"))
-        }
-        let result = &self.contents[self.index];
-        self.index += 1;
-        Ok(&result)
-    }
-    fn done(&self) -> bool {
-        self.index >= self.contents.len()
-    }
-}
-
-enum Point {
-    Point((u64, String)),
-    Origin,
-}
-
-impl TryFrom<Value> for Point {
-    type Error = anyhow::Error;
-
-    fn try_from(value: Value) -> Result<Self, Self::Error> {
-        if let Some(object) = value.as_object() {
-            let slot = value["slot"].as_u64().context("Invalid slot")?;
-            let id = value["id"].as_str().context("Invalid id")?;
-            return Ok(Point::Point((slot, id.to_string())))
-        } else if let Some(string) = value.as_str() {
-            if string == "origin" {
-                return Ok(Point::Origin)
-            } else {
-                return Err(anyhow!("unexpected point string: {}; expected \"origin\"", string));
-            }
-        } else {
-            return Err(anyhow!("unexpected point: expected object or string: {}", value));
-        }
-    }
-}
-
 enum ChainsyncRequest {
     NextBlock,
     SubmitTransaction((String, String)),
@@ -242,7 +198,7 @@ impl TryFrom<Value> for ChainsyncRequest {
 enum HydraWsMessage {
     TxValid(String),
     TxInvalid((String, String)),
-    Unimplemented(String),
+    Unimplemented(()),
 }
 
 impl TryFrom<Value> for HydraWsMessage {
@@ -261,7 +217,47 @@ impl TryFrom<Value> for HydraWsMessage {
             let reason = validation_error["reason"].as_str().context("Invalid reason")?;
             return Ok(HydraWsMessage::TxInvalid((tx_id.to_string(), reason.to_string())));
         } else {
-            return Ok(HydraWsMessage::Unimplemented(tag.to_string()));
+            return Ok(HydraWsMessage::Unimplemented(()));
+        }
+    }
+}
+
+#[derive(Debug)]
+enum FindIntersectionResponse {
+    Found((Point, Point)),
+    NotFound(Point),
+}
+
+impl FindIntersectionResponse {
+    fn new(block: Point, tip: Point) -> FindIntersectionResponse {
+        FindIntersectionResponse::Found((block, tip))
+    }
+}
+
+fn encode_find_intersection_response(x: &FindIntersectionResponse) -> Value {
+    match x {
+        FindIntersectionResponse::Found((block, tip)) => {
+            json!({
+                "jsonrpc": "2.0",
+                "method": "findIntersection",
+                "result": json!({
+                    "intersection": encode_point(&block),
+                    "tip": encode_point(&tip),
+                }),
+            })
+        }
+        FindIntersectionResponse::NotFound(tip) => {
+            json!({
+                "jsonrpc": "2.0",
+                "method": "findIntersection",
+                "error": json!({
+                    "code": 1000,
+                    "message": "intersection not found",
+                    "data": json!({
+                        "tip": encode_point(&tip),
+                    }),
+                }),
+            })
         }
     }
 }
@@ -281,7 +277,7 @@ impl NextBlockResponse {
     }
 }
 
-pub fn encode_next_block_response(x: &NextBlockResponse) -> Value {
+fn encode_next_block_response(x: &NextBlockResponse) -> Value {
     json!({
         "jsonrpc": "2.0",
         "method": "nextBlock",
@@ -421,6 +417,7 @@ fn listen<T: Source>(source: &mut T) -> anyhow::Result<()> {
                 loop {
                     let msg = websocket.read().unwrap();
 
+                    println!("via ogmios client: {}", msg);
                     // We do not want to send back ping/pong messages.
                     if msg.is_binary() || msg.is_text() {
                         let bytes = msg.into_data();
@@ -465,7 +462,24 @@ fn listen<T: Source>(source: &mut T) -> anyhow::Result<()> {
                                         }
                                     }
                                     Ok(ChainsyncRequest::FindIntersection(points)) => {
-
+                                            let ogmios = ogmios.lock().unwrap();
+                                            match ogmios.find_intersection(&points) {
+                                                FindIntersection::Found((block, tip)) => {
+                                                    let response = FindIntersectionResponse::new(block.clone(), tip.clone());
+                                                    let response_json = encode_find_intersection_response(&response);
+                                                    if let Point::Point(ps) = block {
+                                                        if let Some(height) = ps.height {
+                                                            cursor = height as usize;
+                                                        }
+                                                    }
+                                                    websocket.send(Message::Text(response_json.to_string())).unwrap();
+                                                }
+                                                FindIntersection::NotFound(tip) => {
+                                                    let response = FindIntersectionResponse::NotFound(tip);
+                                                    let response_json = encode_find_intersection_response(&response);
+                                                    websocket.send(Message::Text(response_json.to_string())).unwrap();
+                                                }
+                                            }
                                     }
                                     Err(e) => {
                                         websocket.send(Message::Text(format!("couldn't parse request: {:?}", e))).unwrap()
@@ -489,8 +503,11 @@ fn listen<T: Source>(source: &mut T) -> anyhow::Result<()> {
         let e: Event = Event::try_from(v.clone())?;
         let mut o = ogmios.lock().unwrap();
         match ogmios_consume_event(&mut o, e) {
-            Ok(msg) => {
-                println!("{:?}", msg);
+            Ok(OgmiosMessage::Message(s)) => {
+                println!("{:?}", s);
+            }
+            Ok(OgmiosMessage::NoMessage) => {
+                //
             }
             Err(err) => {
                 return Err(anyhow!("ogmios: error consuming hydra event: {}", err))
@@ -537,7 +554,7 @@ fn ogmios_consume_event(ogmios: &mut Ogmios, e: Event) -> anyhow::Result<OgmiosM
             }
         },
         _ => {
-           Ok(OgmiosMessage::Message("nothing to do".to_string()))
+           Ok(OgmiosMessage::NoMessage)
         },
     }
 }
@@ -611,7 +628,7 @@ mod tests {
             .expect("couldn't read file");
         let v: Value = serde_json::from_str(&find_intersection)
             .expect("couldn't parse string as json");
-        let result: ChainsyncRequest = ChainsyncRequest::try_from(v)
+        let _result: ChainsyncRequest = ChainsyncRequest::try_from(v)
             .expect("couldn't parse chainsync request");
     }
 }
