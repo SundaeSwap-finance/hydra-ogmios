@@ -1,17 +1,50 @@
 # hydra-ogmios
 
 This program provides a similar interface to ogmios, but for hydra instead of
-cardano. It connects to the hydra node's websocket port and a custom UDP sink,
-and provides a websocket server allowing clients to follow transactions on the
-head in real time and submit new transactions.
+cardano. It connects to the hydra node's websocket port and provides a websocket
+server allowing clients to follow transactions on the head in real time and
+submit new transactions.
 
 This program works by maintaining a list of "blocks" where a block is treated as
 a set of transactions. When it recieves a "TransactionConfirmed" message from
-the UDP sink, the transaction is recorded in memory. When it receives a
+hydra, the transaction is recorded in memory. When it receives a
 "SnapshotConfirmed" message, the set of transactions in the snapshot are treated
 as a new block which is appended to the list. This program maintains a cursor
 for each ogmios client and responds to each "NextBlock" request with the block
 corresponding to that client's cursor.
+
+# Example FindIntersect request
+```
+{
+  "jsonrpc": "2.0",
+  "method": "findIntersection",
+  "params": {
+    "points": [
+      "origin"
+    ]
+  }
+}
+```
+
+# Example FindIntersect response
+
+```
+{
+  "jsonrpc": "2.0",
+  "method": "findIntersection",
+  "result": {
+    "intersection": {
+      "id":
+ "d7455525a5d411a50ecb82883e4c2009009894b398a0f0d77800de779b640c4943d427514249dada8e21895dd0ff936c5e719a82a5c3b37d22fe6b6bf77ff8cf",
+      "slot": 1727956570
+    },
+    "tip": {
+      "id": "cf308649e0df784159616ec53d6cde3aae3efe487123c5abf92c1a5c501a8b552dd4d2c4518913002f8969887074b9f091f1fab832066a2bf637af2e1e80ac94",
+      "slot": 1727956692
+    }
+  }
+}
+```
 
 # Example NextBlock request
 
