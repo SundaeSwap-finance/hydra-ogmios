@@ -18,13 +18,14 @@ use crate::encode::{encode_json_tx};
 
 use std::sync::Arc;
 use futures::lock::Mutex;
+use futures::stream::SplitSink;
 use tokio::net::TcpListener;
 use std::thread;
 use std::thread::{ThreadId, spawn};
 use tungstenite::http::Uri;
 use tungstenite::{connect, ClientRequestBuilder, Message, accept};
 use tungstenite::client::IntoClientRequest;
-use tokio_tungstenite::{connect_async};
+use tokio_tungstenite::{WebSocketStream, connect_async};
 use futures::SinkExt;
 use futures::StreamExt;
 use tokio::io::{AsyncReadExt};
@@ -313,9 +314,26 @@ fn encode_next_block_response(x: &NextBlockResponse) -> Value {
     })
 }
 
+enum ChainSyncEvent {
+    NotifyNextBlock,
+    RequestNextBlock,
+}
+
+struct ChainSyncClient {
+    cursor: usize,
+    sender: SplitSink<WebSocketStream<tokio::net::TcpStream>, tungstenite::Message>,
+    awaiting_next_block: u64,
+}
+
 async fn listen() -> anyhow::Result<()> {
     let ogmios = Arc::new(Mutex::new(Ogmios::new()));
-    let ogmios_ref_for_hydra_client = ogmios.clone();
+    let sender_ogmios_ref = Arc::clone(&ogmios);
+    let ogmios_ref_for_hydra_client = Arc::clone(&ogmios);
+
+    let (send, mut receive) = tokio::sync::mpsc::unbounded_channel::<ChainSyncEvent>();
+
+    let send_mutex = Arc::new(Mutex::new(send));
+    let send_mutex_1 = Arc::clone(&send_mutex);
 
     // Hydra client thread, for submitting transactions from ogmios client to hydra node
     let request = "ws://127.0.0.1:4001".into_client_request().unwrap();
@@ -327,7 +345,6 @@ async fn listen() -> anyhow::Result<()> {
     let hydra_submittx_mailbox = Arc::new(Mutex::new(HashMap::new()));
     let hydra_submittx_mailbox_1 = Arc::clone(&hydra_submittx_mailbox);
     let handle = tokio::spawn(async move {
-        println!("Spawned");
         let mut tx_submit_tasks = HashMap::new();
         loop {
             {
@@ -385,6 +402,7 @@ async fn listen() -> anyhow::Result<()> {
                                         println!("ogmios: error consuming hydra event: {}", err)
                                     }
                                 }
+                                send_mutex_1.lock().await.send(ChainSyncEvent::NotifyNextBlock);
                             }
                             Ok(HydraWsMessage::TxValid((txid, txbody))) => {
                                 let mut o = ogmios_ref_for_hydra_client.lock().await;
@@ -464,6 +482,40 @@ async fn listen() -> anyhow::Result<()> {
         }
     });
 
+    let clients = Arc::new(Mutex::new(HashMap::<ThreadId, ChainSyncClient>::new())); // map of client send sinks
+
+    let sender_clients_ref = Arc::clone(&clients);
+    // chainsync sender thread
+    tokio::spawn(async move {
+        loop {
+            match receive.recv().await {
+                None => {
+                    // rx is closed
+                }
+                Some(ChainSyncEvent::NotifyNextBlock) => {
+                }
+                Some(ChainSyncEvent::RequestNextBlock) => {
+                }
+                Some(_) => {
+                }
+            }
+            let mut sender_clients = sender_clients_ref.lock().await;
+            let mut clients = sender_clients.values_mut();
+            for client in clients {
+                if client.awaiting_next_block > 0 {
+                    if let Some((has_block, tip)) = sender_ogmios_ref.lock().await.get_block(client.cursor) {
+                        let response = NextBlockResponse::new(has_block.clone(), tip.clone());
+                        let response_json = encode_next_block_response(&response);
+                        client.cursor += 1;
+                        client.awaiting_next_block -= 1;
+                        client.sender.send(Message::Text(response_json.to_string())).await;
+                    }
+                }
+            }
+
+        }
+    });
+
     let ogmios_server = TcpListener::bind("127.0.0.1:9001")
         .await
         .expect("Listening to TCP failed.");
@@ -474,19 +526,28 @@ async fn listen() -> anyhow::Result<()> {
         let ogmios = Arc::clone(&ogmios_ref);
         let hydra_client_receive_queue = Arc::clone(&hydra_client_receive_queue);
         let hydra_submittx_mailbox_ogmios = Arc::clone(&hydra_submittx_mailbox_ogmios);
+        let clients = Arc::clone(&clients);
+        let send = Arc::clone(&send_mutex);
         tokio::spawn(async move {
             println!("New Connection : {}", peer);
-            println!("Spawned ogmios client thread");
             match tokio_tungstenite::accept_async(stream).await {
                 Err(e) => println!("Websocket connection error : {}", e),
                 Ok(ws_stream) => {
                     let my_thread_id = thread::current().id();
-                    let mut cursor = 0;
                     let (mut sender, mut receiver) = ws_stream.split();
+                    clients.lock().await.insert(my_thread_id, ChainSyncClient {
+                        sender: sender,
+                        cursor: 0,
+                        awaiting_next_block: 0,
+                    });
                     loop {
+                        if let Some(mut my_client) = clients.lock().await.get_mut(&my_thread_id) {
+                            if my_client.awaiting_next_block > 0 {
+
+                            }
+                        }
                         let msg = receiver.next().await.unwrap().unwrap();
 
-                        println!("via ogmios client: {}", msg);
                         // We do not want to send back ping/pong messages.
                         if msg.is_binary() || msg.is_text() {
                             let bytes = msg.into_data();
@@ -496,39 +557,36 @@ async fn listen() -> anyhow::Result<()> {
                                     let chainsync_request = ChainsyncRequest::try_from(v);
                                     match chainsync_request {
                                         Ok(ChainsyncRequest::NextBlock) => {
-                                            loop {
-                                                let ogmios = ogmios.lock().await;
-                                                if let Some((has_block, tip)) = ogmios.get_block(cursor) {
-                                                    let response = NextBlockResponse::new(has_block.clone(), tip.clone());
-                                                    let response_json = encode_next_block_response(&response);
-                                                    cursor += 1;
-                                                    sender.send(Message::Text(response_json.to_string())).await;
-                                                    break;
-                                                }
+                                            if let Some(mut my_client) = clients.lock().await.get_mut(&my_thread_id) {
+                                                my_client.awaiting_next_block += 1;
                                             }
+                                            send.lock().await.send(ChainSyncEvent::RequestNextBlock);
                                         }
-                                        Ok(ChainsyncRequest::SubmitTransaction((tx_id, cbor_hex))) => {
-                                            println!("got ogmios request for txsubmit: {:?} {:?} {:?}", my_thread_id, tx_id, cbor_hex);
-                                            let submit_tx = json!({
-                                                "tag": "NewTx",
-                                                "transaction": json!({
-                                                    "cborHex": cbor_hex,
-                                                }),
-                                            });
-                                            {
-                                                let mut rcv = hydra_client_receive_queue.lock().await;
-                                                rcv.push((my_thread_id, tx_id, submit_tx.to_string()));
-                                            }
-                                            // Await response from hydra node
-                                            println!("await response from hydra node comm thread");
-                                            loop {
-                                                let mut mailbox = hydra_submittx_mailbox_ogmios.lock().await;
-                                                if let Some(response) = mailbox.remove(&my_thread_id) {
-                                                    println!("got response from hydra node comm thread: {:?}", response);
-                                                    sender.send(Message::Text(response.to_string())).await;
-                                                    break;
-                                                }
-                                            }
+                                        //Ok(ChainsyncRequest::SubmitTransaction((tx_id, cbor_hex))) => {
+                                        //    println!("got ogmios request for txsubmit: {:?} {:?} {:?}", my_thread_id, tx_id, cbor_hex);
+                                        //    let submit_tx = json!({
+                                        //        "tag": "NewTx",
+                                        //        "transaction": json!({
+                                        //            "cborHex": cbor_hex,
+                                        //        }),
+                                        //    });
+                                        //    {
+                                        //        let mut rcv = hydra_client_receive_queue.lock().await;
+                                        //        rcv.push((my_thread_id, tx_id, submit_tx.to_string()));
+                                        //    }
+                                        //    // Await response from hydra node
+                                        //    println!("await response from hydra node comm thread");
+                                        //    loop {
+                                        //        let mut mailbox = hydra_submittx_mailbox_ogmios.lock().await;
+                                        //        if let Some(response) = mailbox.remove(&my_thread_id) {
+                                        //            println!("got response from hydra node comm thread: {:?}", response);
+                                        //            sender.send(Message::Text(response.to_string())).await;
+                                        //            break;
+                                        //        }
+                                        //    }
+                                        //}
+                                        Ok(ChainsyncRequest::SubmitTransaction(_)) => {
+                                            todo!()
                                         }
                                         Ok(ChainsyncRequest::FindIntersection(points)) => {
                                                 let ogmios = ogmios.lock().await;
@@ -538,25 +596,31 @@ async fn listen() -> anyhow::Result<()> {
                                                         let response_json = encode_find_intersection_response(&response);
                                                         if let Point::Point(ps) = block {
                                                             if let Some(height) = ps.height {
-                                                                cursor = height as usize;
+                                                                if let Some(me) = clients.lock().await.get_mut(&my_thread_id) {
+                                                                    me.cursor = height as usize;
+                                                                }
                                                             }
                                                         }
-                                                        sender.send(Message::Text(response_json.to_string())).await;
+                                                        if let Some(mut my_client) = clients.lock().await.get_mut(&my_thread_id) {
+                                                            my_client.sender.send(Message::Text(response_json.to_string())).await;
+                                                        }
                                                     }
                                                     FindIntersection::NotFound(tip) => {
                                                         let response = FindIntersectionResponse::NotFound(tip);
                                                         let response_json = encode_find_intersection_response(&response);
-                                                        sender.send(Message::Text(response_json.to_string())).await;
+                                                        if let Some(mut my_client) = clients.lock().await.get_mut(&my_thread_id) {
+                                                            my_client.sender.send(Message::Text(response_json.to_string())).await;
+                                                        }
                                                     }
                                                 }
                                         }
                                         Err(e) => {
-                                            sender.send(Message::Text(format!("couldn't parse request: {:?}", e))).await;
+                                            //sender.send(Message::Text(format!("couldn't parse request: {:?}", e))).await;
                                         }
                                     }
                                 }
                                 Err(e) => {
-                                    sender.send(Message::Text(format!("couldn't parse request as json: {:?}", e))).await;
+                                    //sender.send(Message::Text(format!("couldn't parse request as json: {:?}", e))).await;
                                 }
                             }
                         }
@@ -567,7 +631,6 @@ async fn listen() -> anyhow::Result<()> {
     }
 
     let () = handle.await.unwrap();
-    println!("DONE");
     Ok(())
 }
 
