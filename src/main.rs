@@ -342,24 +342,30 @@ async fn listen() -> anyhow::Result<()> {
     println!("websocket connected to hydra node");
     let (mut hydra_node_write, mut hydra_node_read) = stream.split();
     let hydra_client_queue = Arc::new(Mutex::new(Vec::<(ThreadId, String, String)>::new()));
-    let hydra_client_send_queue = hydra_client_queue.clone();
     let hydra_submittx_mailbox = Arc::new(Mutex::new(HashMap::new()));
     let hydra_submittx_mailbox_1 = Arc::clone(&hydra_submittx_mailbox);
-    let handle = tokio::spawn(async move {
-        let mut tx_submit_tasks = HashMap::new();
+    let tx_submit_tasks = Arc::new(Mutex::new(HashMap::new()));
+    let tx_submit_tasks_1 = Arc::clone(&tx_submit_tasks);
+    let hydra_client_send_queue = hydra_client_queue.clone();
+    tokio::spawn(async move {
         loop {
             {
                 let mut send = hydra_client_send_queue.lock().await;
                 if let Some((thread_id, tx_id, msg)) = send.pop() {
                     println!("got request for txsubmit to hydra via ogmios: {:?} {:?} {:?}", thread_id, tx_id, msg);
                     let message = Message::text(msg);
+                    println!("sending message to the hydra node now");
                     hydra_node_write.send(message).await.unwrap();
                     // We are awaiting a confirmation on this tx submission
-                    tx_submit_tasks.insert(tx_id.to_string(), thread_id);
+                    tx_submit_tasks_1.lock().await.insert(tx_id.to_string(), thread_id);
                 }
             }
+        }
+    });
+    let handle = tokio::spawn(async move {
+        loop {
+            println!("awaiting message from the hydra node");
             let msg = hydra_node_read.next().await.unwrap().unwrap();
-            println!("recieved hydra ws message: {:?}", msg);
             if msg.is_binary() || msg.is_text() {
                 let bytes = msg.into_data();
                 let v: Result<Value, _> = serde_json::from_slice(&bytes);
@@ -376,7 +382,7 @@ async fn listen() -> anyhow::Result<()> {
                                 };
                                 match ogmios_consume_event(&mut o, event) {
                                     Ok(OgmiosMessage::Message(s)) => {
-                                        println!("OGMIOSMESSAGE: {:?}", s);
+                                        println!("Ogmios state update: {:?}", s);
                                     }
                                     Ok(OgmiosMessage::NoMessage) => {
                                         //
@@ -394,7 +400,7 @@ async fn listen() -> anyhow::Result<()> {
                                 };
                                 match ogmios_consume_event(&mut o, event) {
                                     Ok(OgmiosMessage::Message(s)) => {
-                                        println!("OGMIOSMESSAGE: {:?}", s);
+                                        println!("Ogmios state update: {:?}", s);
                                     }
                                     Ok(OgmiosMessage::NoMessage) => {
                                         //
@@ -420,7 +426,7 @@ async fn listen() -> anyhow::Result<()> {
                                 };
                                 match ogmios_consume_event(&mut o, event) {
                                     Ok(OgmiosMessage::Message(s)) => {
-                                        println!("OGMIOSMESSAGE: {:?}", s);
+                                        println!("Ogmios state update: {:?}", s);
                                     }
                                     Ok(OgmiosMessage::NoMessage) => {
                                         //
@@ -432,7 +438,7 @@ async fn listen() -> anyhow::Result<()> {
                                 // FIXME: we should probably have a vec of submit tasks per
                                 // thread id instead of just one so that an ogmios client can
                                 // do multiple tx submissions without waiting for us to respond
-                                if let Some(thread_id) = tx_submit_tasks.remove(&txid.to_string()) {
+                                if let Some(thread_id) = tx_submit_tasks.lock().await.remove(&txid.to_string()) {
                                     println!("got txvalid: {:?}", txid);
                                     // Send back the response from hydra for this txid
                                     // submission
@@ -451,7 +457,7 @@ async fn listen() -> anyhow::Result<()> {
                                 }
                             }
                             Ok(HydraWsMessage::TxInvalid((txid, error))) => {
-                                if let Some(thread_id) = tx_submit_tasks.remove(&txid.to_string()) {
+                                if let Some(thread_id) = tx_submit_tasks.lock().await.remove(&txid.to_string()) {
                                     println!("got txinvalid: {:?}", txid);
                                     let response = json!({
                                         "jsonrpc": "2.0",
@@ -547,11 +553,6 @@ async fn listen() -> anyhow::Result<()> {
                         awaiting_next_block: 0,
                     });
                     loop {
-                        if let Some(mut my_client) = clients.lock().await.get_mut(&my_thread_id) {
-                            if my_client.awaiting_next_block > 0 {
-
-                            }
-                        }
                         let msg = receiver.next().await.unwrap().unwrap();
 
                         // We do not want to send back ping/pong messages.
@@ -580,7 +581,6 @@ async fn listen() -> anyhow::Result<()> {
                                                 let mut rcv = hydra_client_receive_queue.lock().await;
                                                 rcv.push((my_thread_id, tx_id, submit_tx.to_string()));
                                             }
-                                            println!("await response from hydra node comm thread");
                                         }
                                         Ok(ChainsyncRequest::FindIntersection(points)) => {
                                                 let ogmios = ogmios.lock().await;
