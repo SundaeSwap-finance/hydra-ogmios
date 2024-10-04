@@ -20,6 +20,7 @@ use std::sync::Arc;
 use futures::lock::Mutex;
 use futures::stream::SplitSink;
 use tokio::net::TcpListener;
+use tokio::sync::mpsc;
 use std::thread;
 use std::thread::{ThreadId, spawn};
 use tungstenite::http::Uri;
@@ -326,32 +327,63 @@ struct ChainSyncClient {
     awaiting_next_block: u64,
 }
 
-async fn listen() -> anyhow::Result<()> {
+struct Config {
+    hydra_node_client_address: String, // "ws://127.0.0.1:4001"
+    ogmios_server_address: String, // "127.0.0.1:9001"
+}
+
+fn submit_transaction_success(txid: String) -> Value {
+    json!({
+        "jsonrpc": "2.0",
+        "method": "submitTransaction",
+        "result": json!({
+            "transaction": json!({
+                "id": txid,
+            }),
+        }),
+    })
+}
+
+fn submit_transaction_error(error: String) -> Value {
+    json!({
+        "jsonrpc": "2.0",
+        "method": "submitTransaction",
+        "result": json!({
+            "error": json!({
+                "code": json!(null),
+                "message": error,
+                "data": json!(null),
+            }),
+        }),
+    })
+}
+
+async fn listen(config: Config) -> anyhow::Result<()> {
     let ogmios = Arc::new(Mutex::new(Ogmios::new()));
     let sender_ogmios_ref = Arc::clone(&ogmios);
     let ogmios_ref_for_hydra_client = Arc::clone(&ogmios);
 
-    let (send, mut receive) = tokio::sync::mpsc::unbounded_channel::<ChainSyncEvent>();
+    let (send, mut receive) = mpsc::unbounded_channel::<ChainSyncEvent>();
 
     let send_mutex = Arc::new(Mutex::new(send));
     let send_mutex_1 = Arc::clone(&send_mutex);
 
     // Hydra client thread, for submitting transactions from ogmios client to hydra node
-    let request = "ws://127.0.0.1:4001".into_client_request().unwrap();
+    let request = config.hydra_node_client_address.into_client_request().unwrap();
     let (stream, _) = connect_async(request).await.unwrap();
     println!("websocket connected to hydra node");
     let (mut hydra_node_write, mut hydra_node_read) = stream.split();
     let hydra_client_queue = Arc::new(Mutex::new(Vec::<(ThreadId, String, String)>::new()));
+    let (mut hydra_client_tx, mut hydra_client_rx) = mpsc::unbounded_channel::<(ThreadId, String, String)>();
+    let hydra_client_tx = Arc::new(Mutex::new(hydra_client_tx));
     let hydra_submittx_mailbox = Arc::new(Mutex::new(HashMap::new()));
     let hydra_submittx_mailbox_1 = Arc::clone(&hydra_submittx_mailbox);
     let tx_submit_tasks = Arc::new(Mutex::new(HashMap::new()));
     let tx_submit_tasks_1 = Arc::clone(&tx_submit_tasks);
-    let hydra_client_send_queue = hydra_client_queue.clone();
     tokio::spawn(async move {
         loop {
             {
-                let mut send = hydra_client_send_queue.lock().await;
-                if let Some((thread_id, tx_id, msg)) = send.pop() {
+                if let Some((thread_id, tx_id, msg)) = hydra_client_rx.recv().await {
                     println!("got request for txsubmit to hydra via ogmios: {:?} {:?} {:?}", thread_id, tx_id, msg);
                     let message = Message::text(msg);
                     hydra_node_write.send(message).await.unwrap();
@@ -438,17 +470,7 @@ async fn listen() -> anyhow::Result<()> {
                                 // do multiple tx submissions without waiting for us to respond
                                 if let Some(thread_id) = tx_submit_tasks.lock().await.remove(&txid.to_string()) {
                                     println!("got txvalid: {:?}", txid);
-                                    // Send back the response from hydra for this txid
-                                    // submission
-                                    let response = json!({
-                                        "jsonrpc": "2.0",
-                                        "method": "submitTransaction",
-                                        "result": json!({
-                                            "transaction": json!({
-                                                "id": txid,
-                                            }),
-                                        }),
-                                    });
+                                    let response = submit_transaction_success(txid);
                                     let mut mailbox = hydra_submittx_mailbox_1.lock().await;
                                     mailbox.insert(thread_id, response);
                                     send_mutex_1.lock().await.send(ChainSyncEvent::ReceivedTxStatus);
@@ -457,17 +479,7 @@ async fn listen() -> anyhow::Result<()> {
                             Ok(HydraWsMessage::TxInvalid((txid, error))) => {
                                 if let Some(thread_id) = tx_submit_tasks.lock().await.remove(&txid.to_string()) {
                                     println!("got txinvalid: {:?}", txid);
-                                    let response = json!({
-                                        "jsonrpc": "2.0",
-                                        "method": "submitTransaction",
-                                        "result": json!({
-                                            "error": json!({
-                                                "code": json!(null),
-                                                "message": error,
-                                                "data": json!(null),
-                                            }),
-                                        }),
-                                    });
+                                    let response = submit_transaction_error(error);
                                     let mut mailbox = hydra_submittx_mailbox_1.lock().await;
                                     mailbox.insert(thread_id, response);
                                     send_mutex_1.lock().await.send(ChainSyncEvent::ReceivedTxStatus);
@@ -526,15 +538,14 @@ async fn listen() -> anyhow::Result<()> {
         }
     });
 
-    let ogmios_server = TcpListener::bind("127.0.0.1:9001")
+    let ogmios_server = TcpListener::bind(config.ogmios_server_address)
         .await
         .expect("Listening to TCP failed.");
     let ogmios_ref = Arc::clone(&ogmios);
-    let hydra_client_receive_queue = hydra_client_queue.clone();
     let hydra_submittx_mailbox_ogmios = Arc::clone(&hydra_submittx_mailbox);
     while let Ok((stream, peer)) = ogmios_server.accept().await {
         let ogmios = Arc::clone(&ogmios_ref);
-        let hydra_client_receive_queue = Arc::clone(&hydra_client_receive_queue);
+        let hydra_client_tx = Arc::clone(&hydra_client_tx);
         let hydra_submittx_mailbox_ogmios = Arc::clone(&hydra_submittx_mailbox_ogmios);
         let clients = Arc::clone(&clients);
         let send = Arc::clone(&send_mutex);
@@ -580,10 +591,7 @@ async fn listen() -> anyhow::Result<()> {
                                                     "cborHex": cbor_hex,
                                                 }),
                                             });
-                                            {
-                                                let mut rcv = hydra_client_receive_queue.lock().await;
-                                                rcv.push((my_thread_id, tx_id, submit_tx.to_string()));
-                                            }
+                                            hydra_client_tx.lock().await.send((my_thread_id, tx_id, submit_tx.to_string()));
                                         }
                                         Ok(ChainsyncRequest::FindIntersection(points)) => {
                                                 let ogmios = ogmios.lock().await;
@@ -599,14 +607,14 @@ async fn listen() -> anyhow::Result<()> {
                                                             }
                                                         }
                                                         if let Some(mut my_client) = clients.lock().await.get_mut(&my_thread_id) {
-                                                            my_client.sender.send(Message::Text(response_json.to_string())).await;
+                                                            let _ = my_client.sender.send(Message::Text(response_json.to_string())).await;
                                                         }
                                                     }
                                                     FindIntersection::NotFound(tip) => {
                                                         let response = FindIntersectionResponse::NotFound(tip);
                                                         let response_json = encode_find_intersection_response(&response);
                                                         if let Some(mut my_client) = clients.lock().await.get_mut(&my_thread_id) {
-                                                            my_client.sender.send(Message::Text(response_json.to_string())).await;
+                                                            let _ = my_client.sender.send(Message::Text(response_json.to_string())).await;
                                                         }
                                                     }
                                                 }
@@ -673,7 +681,11 @@ fn ogmios_consume_event(ogmios: &mut Ogmios, e: Event) -> anyhow::Result<OgmiosM
 
 #[tokio::main]
 async fn main() {
-    listen().await.unwrap();
+    let config = Config {
+        hydra_node_client_address: "ws://127.0.0.1:4001".to_string(),
+        ogmios_server_address: "127.0.0.1:9001".to_string(),
+    };
+    listen(config).await.unwrap();
 }
 
 #[cfg(test)]
