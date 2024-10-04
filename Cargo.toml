@@ -23,3 +23,5 @@ blake2 = "0.10.6"
 futures = "0.3"
 tokio = { version = "1", features = ["full"] }
 tokio-tungstenite = "*"
+clap_derive = { version = "4.0.0-rc.1" }
+clap = { version = "4.5.19", features = ["derive"] }
