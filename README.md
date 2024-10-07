@@ -13,6 +13,14 @@ as a new block which is appended to the list. This program maintains a cursor
 for each ogmios client and responds to each "NextBlock" request with the block
 corresponding to that client's cursor.
 
+## UDP sink example implementation
+
+The program can optionally obtain hydra events via UDP stream instead of by
+connecting to the hydra node's websocket API. This requires running a hydra node
+with a custom UDP event sink. An example implementation can be found here:
+
+https://github.com/SundaeSwap-finance/hydra/commit/90ffe09f649c44fadd1683432d764b5eeb9086b6
+
 # Example FindIntersect request
 ```
 {
